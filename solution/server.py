@@ -336,6 +336,15 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Filter emails by subject keyword (optional)",
                     },
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Only return emails with these labels after classification. "
+                            "Values: URGENT, IMPORTANT, NORMAL, LOW, NEWSLETTER, SPAM. "
+                            "Omit to return all labels."
+                        ),
+                    },
                 },
             },
         ),
@@ -733,12 +742,28 @@ async def _dispatch(name: str, args: dict) -> dict | list:
         classified_pairs = list(zip(emails_meta, final_results))
         classified_pairs.sort(key=lambda p: priority.get(p[1].label, 99))
 
+        # Optional post-classification label filter
+        label_filter: set[str] = {l.upper() for l in args.get("labels", [])}
+        if label_filter:
+            classified_pairs = [(m, r) for m, r in classified_pairs if r.label in label_filter]
+
+        # Slim payload for batch: omit key_points to keep response size manageable.
+        # Full detail is available via classify_single_email.
         classified_output = [
-            format_classification(asdict(meta), result)
+            {
+                "uid": meta.uid,
+                "subject": meta.subject,
+                "from": meta.from_addr,
+                "date": meta.date,
+                "label": result.label,
+                "confidence": result.confidence,
+                "reasoning": result.reasoning,
+                "suggested_action": result.suggested_action,
+                "is_seen": meta.is_seen,
+            }
             for meta, result in classified_pairs
         ]
 
-        # Quick stats
         label_counts: dict[str, int] = {}
         for _, r in classified_pairs:
             label_counts[r.label] = label_counts.get(r.label, 0) + 1
