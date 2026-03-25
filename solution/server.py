@@ -25,8 +25,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from classifier import ClassificationResult, EmailClassifier, EmailInput
-from email_client import EmailClient, EmailConfig, SearchFilter
+from classifier import ClassificationResult, DraftResult, EmailClassifier, EmailInput, ResponseOptions
+from email_client import EmailClient, EmailConfig, EmailMetadata, SearchFilter
 
 load_dotenv()
 
@@ -80,6 +80,52 @@ def format_classification(
         "key_points": result.key_points,
         "is_seen": meta_dict.get("is_seen"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Content-fallback helpers
+# ---------------------------------------------------------------------------
+
+_LOW_CONFIDENCE_THRESHOLD = 60
+
+
+def _enrich_with_body(
+    client: EmailClient,
+    classifier: EmailClassifier,
+    emails_meta: list[EmailMetadata],
+    results: list[ClassificationResult],
+) -> list[ClassificationResult]:
+    """Re-classify emails whose initial confidence is below the threshold.
+
+    Fetches the full body for each such email and runs a second classification
+    pass so that content — not just headers — informs the label.
+    """
+    enriched = list(results)
+    for i, (meta, result) in enumerate(zip(emails_meta, results)):
+        if result.confidence >= _LOW_CONFIDENCE_THRESHOLD:
+            continue
+        full = client.fetch_full_email(meta.uid, meta.mailbox)
+        if not full:
+            continue
+        email_input = EmailInput(
+            subject=full.subject,
+            from_addr=full.from_addr,
+            to_addr=full.to_addr,
+            date=full.date,
+            snippet=full.snippet or full.text_body[:400],
+        )
+        try:
+            enriched[i] = classifier.classify(email_input)
+        except Exception as ex:
+            # Keep the original result; don't fail the whole batch
+            enriched[i] = ClassificationResult(
+                label=result.label,
+                confidence=result.confidence,
+                reasoning=f"{result.reasoning} (body fetch failed: {ex})",
+                suggested_action=result.suggested_action,
+                key_points=result.key_points,
+            )
+    return enriched
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +278,63 @@ async def list_tools() -> list[Tool]:
             description="Test the IMAP connection to verify credentials and server are working.",
             inputSchema={"type": "object", "properties": {}},
         ),
+        Tool(
+            name="analyze_email_for_response",
+            description=(
+                "Read a full email and return contextually appropriate response options, "
+                "the email's detected tone, a summary of what it's asking, and whether "
+                "clarification from the user is needed before drafting a reply. "
+                "Call this first before draft_email_response."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "UID of the email to analyze",
+                    },
+                    "mailbox": {
+                        "type": "string",
+                        "description": "Mailbox containing the email (default: INBOX)",
+                        "default": "INBOX",
+                    },
+                },
+                "required": ["uid"],
+            },
+        ),
+        Tool(
+            name="draft_email_response",
+            description=(
+                "Draft a reply to an email given the user's chosen core answer and optional "
+                "clarification. Fetches the full email for context; tone of the reply is "
+                "matched to the original. Use analyze_email_for_response first to get "
+                "the list of response options to present to the user."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "UID of the email to reply to",
+                    },
+                    "mailbox": {
+                        "type": "string",
+                        "description": "Mailbox containing the email (default: INBOX)",
+                        "default": "INBOX",
+                    },
+                    "core_answer": {
+                        "type": "string",
+                        "description": "The user's core answer, e.g. 'Yes, I can attend'",
+                    },
+                    "clarification": {
+                        "type": "string",
+                        "description": "Optional extra context or reason from the user",
+                        "default": "",
+                    },
+                },
+                "required": ["uid", "core_answer"],
+            },
+        ),
     ]
 
 
@@ -331,6 +434,7 @@ async def _dispatch(name: str, args: dict) -> dict | list:
             for m in emails_meta
         ]
         results = classifier.classify_batch(inputs)
+        results = _enrich_with_body(client, classifier, emails_meta, results)
 
         # Sort by priority: URGENT → IMPORTANT → NORMAL → LOW → NEWSLETTER → SPAM
         priority = {"URGENT": 0, "IMPORTANT": 1, "NORMAL": 2, "LOW": 3, "NEWSLETTER": 4, "SPAM": 5}
@@ -378,17 +482,69 @@ async def _dispatch(name: str, args: dict) -> dict | list:
             for m in emails_meta
         ]
         results = classifier.classify_batch(inputs)
+        results = _enrich_with_body(client, classifier, emails_meta, results)
         pairs = list(zip(inputs, results))
         summary_text = classifier.generate_inbox_summary(pairs)
 
         label_counts: dict[str, int] = {}
-        for _, r in results:
+        for r in results:
             label_counts[r.label] = label_counts.get(r.label, 0) + 1
 
         return {
             "summary": summary_text,
             "breakdown": label_counts,
             "total_analyzed": len(emails_meta),
+        }
+
+    # ------------------------------------------------------------------
+    elif name == "analyze_email_for_response":
+        uid = str(args["uid"])
+        mailbox = args.get("mailbox", "INBOX")
+        full = client.fetch_full_email(uid, mailbox)
+        if not full:
+            return {"error": f"Email UID {uid} not found in {mailbox}"}
+
+        classifier = get_classifier()
+        options: ResponseOptions = classifier.analyze_for_response(
+            subject=full.subject,
+            from_addr=full.from_addr,
+            body=full.text_body or full.snippet,
+        )
+        return {
+            "uid": uid,
+            "email_summary": options.email_summary,
+            "detected_tone": options.detected_tone,
+            "suggested_responses": options.suggested_responses,
+            "needs_clarification": options.needs_clarification,
+            "clarification_prompt": options.clarification_prompt,
+        }
+
+    # ------------------------------------------------------------------
+    elif name == "draft_email_response":
+        uid = str(args["uid"])
+        mailbox = args.get("mailbox", "INBOX")
+        core_answer = str(args["core_answer"])
+        clarification = str(args.get("clarification", ""))
+
+        full = client.fetch_full_email(uid, mailbox)
+        if not full:
+            return {"error": f"Email UID {uid} not found in {mailbox}"}
+
+        classifier = get_classifier()
+        draft: DraftResult = classifier.draft_response(
+            subject=full.subject,
+            from_addr=full.from_addr,
+            to_addr=full.to_addr,
+            body=full.text_body or full.snippet,
+            core_answer=core_answer,
+            clarification=clarification,
+        )
+        return {
+            "uid": uid,
+            "reply_to": full.from_addr,
+            "subject": draft.subject,
+            "body": draft.body,
+            "tone_used": draft.tone_used,
         }
 
     else:

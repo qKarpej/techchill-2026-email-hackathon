@@ -228,7 +228,7 @@ class EmailClient:
         conn = self._connect()
         try:
             conn.select(mailbox, readonly=True)
-            _, data = conn.fetch(uid, "(UID FLAGS RFC822.SIZE RFC822)")
+            _, data = conn.uid("FETCH", uid, "(UID FLAGS RFC822.SIZE RFC822)")
 
             for item in data:
                 if not isinstance(item, tuple):
@@ -277,7 +277,7 @@ class EmailClient:
         conn = self._connect()
         try:
             conn.select(mailbox, readonly=False)
-            conn.store(uid, "+FLAGS", "\\Seen")
+            conn.uid("STORE", uid, "+FLAGS", "\\Seen")
         finally:
             conn.logout()
 
@@ -285,7 +285,7 @@ class EmailClient:
         conn = self._connect()
         try:
             conn.select(mailbox, readonly=False)
-            conn.store(uid, "+FLAGS", "\\Flagged")
+            conn.uid("STORE", uid, "+FLAGS", "\\Flagged")
         finally:
             conn.logout()
 
