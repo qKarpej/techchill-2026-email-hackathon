@@ -1,0 +1,11 @@
+[project]
+name = "email-classifier-mcp"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.39.0",
+    "mcp>=1.6.0",
+    "imapclient>=3.0.1",
+    "mail-parser>=3.15.0",
+    "python-dotenv>=1.0.1",
+]

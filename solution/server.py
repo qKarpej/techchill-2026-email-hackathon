@@ -31,17 +31,96 @@ from email_client import EmailClient, EmailConfig, SearchFilter
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Config from environment variables
+# Provider IMAP settings
 # ---------------------------------------------------------------------------
 
-def get_email_config() -> EmailConfig:
-    return EmailConfig(
-        user=os.environ["EMAIL_USER"],
-        password=os.environ["EMAIL_PASSWORD"],
-        host=os.environ.get("EMAIL_IMAP_HOST", "imap.gmail.com"),
-        port=int(os.environ.get("EMAIL_IMAP_PORT", "993")),
-        use_ssl=os.environ.get("EMAIL_USE_SSL", "true").lower() != "false",
-    )
+PROVIDERS = {
+    "gmail":      {"host": "imap.gmail.com",          "port": 993, "ssl": True},
+    "outlook":    {"host": "outlook.office365.com",    "port": 993, "ssl": True},
+    "hotmail":    {"host": "outlook.office365.com",    "port": 993, "ssl": True},
+    "yahoo":      {"host": "imap.mail.yahoo.com",     "port": 993, "ssl": True},
+    "icloud":     {"host": "imap.mail.me.com",        "port": 993, "ssl": True},
+    "aol":        {"host": "imap.aol.com",            "port": 993, "ssl": True},
+    "zoho":       {"host": "imap.zoho.com",           "port": 993, "ssl": True},
+    "protonmail": {"host": "127.0.0.1",               "port": 1143, "ssl": False},
+    "fastmail":   {"host": "imap.fastmail.com",       "port": 993, "ssl": True},
+    "gmx":        {"host": "imap.gmx.com",            "port": 993, "ssl": True},
+    "mail.ru":    {"host": "imap.mail.ru",            "port": 993, "ssl": True},
+    "yandex":     {"host": "imap.yandex.com",         "port": 993, "ssl": True},
+}
+
+# ---------------------------------------------------------------------------
+# Multi-account config
+# ---------------------------------------------------------------------------
+
+
+def _get_accounts() -> list[dict]:
+    """
+    Load accounts from environment.
+
+    Multi-account:  EMAIL_ACCOUNTS='[{"provider":"gmail","username":"...","password":"..."},...]'
+    Single account: EMAIL_USER + EMAIL_PASSWORD  (+ optional EMAIL_IMAP_HOST, EMAIL_IMAP_PORT, EMAIL_USE_SSL)
+    """
+    accounts_json = os.environ.get("EMAIL_ACCOUNTS")
+    if accounts_json:
+        try:
+            return json.loads(accounts_json)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"EMAIL_ACCOUNTS is not valid JSON: {e}")
+
+    # Fallback: single account from legacy env vars
+    username = os.environ.get("EMAIL_USER")
+    password = os.environ.get("EMAIL_PASSWORD")
+    if not username or not password:
+        return []
+
+    account: dict = {"username": username, "password": password}
+    if os.environ.get("EMAIL_IMAP_HOST"):
+        account["host"] = os.environ["EMAIL_IMAP_HOST"]
+        account["port"] = int(os.environ.get("EMAIL_IMAP_PORT", "993"))
+        account["ssl"] = os.environ.get("EMAIL_USE_SSL", "true").lower() == "true"
+    else:
+        account["provider"] = os.environ.get("EMAIL_PROVIDER", "gmail")
+    return [account]
+
+
+def _make_client(account: dict) -> EmailClient:
+    """Build an EmailClient from an account dict."""
+    provider = account.get("provider", "").lower()
+    if provider in PROVIDERS:
+        settings = PROVIDERS[provider]
+        host = account.get("host", settings["host"])
+        port = account.get("port", settings["port"])
+        ssl = account.get("ssl", settings["ssl"])
+    elif "host" in account:
+        host = account["host"]
+        port = account.get("port", 993)
+        ssl = account.get("ssl", True)
+    else:
+        raise RuntimeError(
+            f"Unknown provider '{provider}' and no 'host' specified. "
+            f"Known providers: {', '.join(PROVIDERS.keys())}"
+        )
+
+    return EmailClient(EmailConfig(
+        user=account["username"],
+        password=account["password"],
+        host=host,
+        port=port,
+        use_ssl=ssl,
+    ))
+
+
+def _get_client(account_id: int = 0) -> EmailClient:
+    accounts = _get_accounts()
+    if not accounts:
+        raise RuntimeError(
+            "No email accounts configured. "
+            "Set EMAIL_USER/EMAIL_PASSWORD, or EMAIL_ACCOUNTS as JSON."
+        )
+    if account_id >= len(accounts):
+        raise RuntimeError(f"Account index {account_id} out of range (have {len(accounts)} accounts)")
+    return _make_client(accounts[account_id])
 
 
 def get_classifier() -> EmailClassifier:
@@ -89,9 +168,21 @@ def format_classification(
 server = Server("email-classifier-mcp")
 
 
+ACCOUNT_ID_PROP = {
+    "type": "integer",
+    "description": "Account index (default 0). Use list_accounts to see all accounts.",
+    "default": 0,
+}
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
+        Tool(
+            name="list_accounts",
+            description="List all configured email accounts. Returns index, provider, and username for each.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
         Tool(
             name="classify_inbox",
             description=(
@@ -103,6 +194,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "account_id": ACCOUNT_ID_PROP,
                     "limit": {
                         "type": "integer",
                         "description": "Number of recent emails to classify (default: 20, max: 50)",
@@ -139,6 +231,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "account_id": ACCOUNT_ID_PROP,
                     "uid": {
                         "type": "string",
                         "description": "The UID of the email to classify",
@@ -162,6 +255,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "account_id": ACCOUNT_ID_PROP,
                     "limit": {
                         "type": "integer",
                         "description": "Number of recent emails to analyze (default: 30)",
@@ -178,7 +272,12 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="list_mailboxes",
             description="List all mailbox folders available in the email account.",
-            inputSchema={"type": "object", "properties": {}},
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "account_id": ACCOUNT_ID_PROP,
+                },
+            },
         ),
         Tool(
             name="fetch_email_content",
@@ -190,6 +289,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "account_id": ACCOUNT_ID_PROP,
                     "uid": {
                         "type": "string",
                         "description": "The UID of the email to fetch",
@@ -209,6 +309,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "account_id": ACCOUNT_ID_PROP,
                     "uid": {"type": "string", "description": "Email UID to mark as seen"},
                     "mailbox": {"type": "string", "default": "INBOX"},
                 },
@@ -221,6 +322,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "account_id": ACCOUNT_ID_PROP,
                     "uid": {"type": "string", "description": "Email UID to flag"},
                     "mailbox": {"type": "string", "default": "INBOX"},
                 },
@@ -230,7 +332,12 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="test_connection",
             description="Test the IMAP connection to verify credentials and server are working.",
-            inputSchema={"type": "object", "properties": {}},
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "account_id": ACCOUNT_ID_PROP,
+                },
+            },
         ),
     ]
 
@@ -246,18 +353,34 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 async def _dispatch(name: str, args: dict) -> dict | list:
-    config = get_email_config()
-    client = EmailClient(config)
+    account_id = int(args.get("account_id", 0))
+
+    # ------------------------------------------------------------------
+    if name == "list_accounts":
+        accounts = _get_accounts()
+        return {
+            "accounts": [
+                {
+                    "index": i,
+                    "provider": a.get("provider", "custom"),
+                    "username": a.get("username", ""),
+                }
+                for i, a in enumerate(accounts)
+            ],
+            "total": len(accounts),
+        }
+
+    client = _get_client(account_id)
 
     # ------------------------------------------------------------------
     if name == "test_connection":
         success, message = client.test_connection()
-        return {"success": success, "message": message}
+        return {"success": success, "message": message, "account_id": account_id}
 
     # ------------------------------------------------------------------
     elif name == "list_mailboxes":
         mailboxes = client.list_mailboxes()
-        return {"mailboxes": mailboxes, "count": len(mailboxes)}
+        return {"mailboxes": mailboxes, "count": len(mailboxes), "account_id": account_id}
 
     # ------------------------------------------------------------------
     elif name == "fetch_email_content":
