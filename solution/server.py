@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import asdict
 
 from dotenv import load_dotenv
@@ -80,6 +81,35 @@ def format_classification(
         "key_points": result.key_points,
         "is_seen": meta_dict.get("is_seen"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Classification cache
+# ---------------------------------------------------------------------------
+
+_CACHE_TTL = 3600.0  # seconds — re-classify after 1 hour
+_classification_cache: dict[str, tuple[ClassificationResult, float]] = {}
+
+
+def _cache_key(meta: EmailMetadata) -> str:
+    """Stable key: prefer message_id (globally unique), fall back to mailbox:uid."""
+    mid = (meta.message_id or "").strip()
+    return mid if mid else f"{meta.mailbox}:{meta.uid}"
+
+
+def _get_cached(key: str) -> ClassificationResult | None:
+    entry = _classification_cache.get(key)
+    if entry is None:
+        return None
+    result, ts = entry
+    if time.monotonic() - ts > _CACHE_TTL:
+        del _classification_cache[key]
+        return None
+    return result
+
+
+def _set_cached(key: str, result: ClassificationResult) -> None:
+    _classification_cache[key] = (result, time.monotonic())
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +422,11 @@ async def _dispatch(name: str, args: dict) -> dict | list:
         if not full:
             return {"error": f"Email UID {uid} not found"}
 
+        key = (full.message_id or "").strip() or f"{mailbox}:{uid}"
+        cached = _get_cached(key)
+        if cached:
+            return {**format_classification(asdict(full), cached), "from_cache": True}
+
         classifier = get_classifier()
         email_input = EmailInput(
             subject=full.subject,
@@ -401,6 +436,7 @@ async def _dispatch(name: str, args: dict) -> dict | list:
             snippet=full.snippet or full.text_body[:400],
         )
         result = classifier.classify(email_input)
+        _set_cached(key, result)
         return format_classification(asdict(full), result)
 
     # ------------------------------------------------------------------
@@ -422,23 +458,35 @@ async def _dispatch(name: str, args: dict) -> dict | list:
                 "total": 0,
             }
 
-        classifier = get_classifier()
-        inputs = [
-            EmailInput(
-                subject=m.subject,
-                from_addr=m.from_addr,
-                to_addr=m.to_addr,
-                date=m.date,
-                snippet="",  # Metadata only for batch — fast
-            )
-            for m in emails_meta
-        ]
-        results = classifier.classify_batch(inputs)
-        results = _enrich_with_body(client, classifier, emails_meta, results)
+        # Serve cached results; only classify emails we haven't seen recently
+        cache_keys = [_cache_key(m) for m in emails_meta]
+        results: list[ClassificationResult | None] = [_get_cached(k) for k in cache_keys]
+
+        uncached_idx = [i for i, r in enumerate(results) if r is None]
+        if uncached_idx:
+            classifier = get_classifier()
+            uncached_inputs = [
+                EmailInput(
+                    subject=emails_meta[i].subject,
+                    from_addr=emails_meta[i].from_addr,
+                    to_addr=emails_meta[i].to_addr,
+                    date=emails_meta[i].date,
+                    snippet="",
+                )
+                for i in uncached_idx
+            ]
+            uncached_meta = [emails_meta[i] for i in uncached_idx]
+            new_results = classifier.classify_batch(uncached_inputs)
+            new_results = _enrich_with_body(client, classifier, uncached_meta, new_results)
+            for i, result in zip(uncached_idx, new_results):
+                results[i] = result
+                _set_cached(cache_keys[i], result)
+
+        final_results: list[ClassificationResult] = results  # type: ignore[assignment]
 
         # Sort by priority: URGENT → IMPORTANT → NORMAL → LOW → NEWSLETTER → SPAM
         priority = {"URGENT": 0, "IMPORTANT": 1, "NORMAL": 2, "LOW": 3, "NEWSLETTER": 4, "SPAM": 5}
-        classified_pairs = list(zip(emails_meta, results))
+        classified_pairs = list(zip(emails_meta, final_results))
         classified_pairs.sort(key=lambda p: priority.get(p[1].label, 99))
 
         classified_output = [
@@ -470,24 +518,44 @@ async def _dispatch(name: str, args: dict) -> dict | list:
         if not emails_meta:
             return {"summary": "Your inbox appears to be empty or no emails match the criteria."}
 
-        classifier = get_classifier()
-        inputs = [
+        cache_keys = [_cache_key(m) for m in emails_meta]
+        results: list[ClassificationResult | None] = [_get_cached(k) for k in cache_keys]
+
+        uncached_idx = [i for i, r in enumerate(results) if r is None]
+        if uncached_idx:
+            classifier = get_classifier()
+            uncached_inputs = [
+                EmailInput(
+                    subject=emails_meta[i].subject,
+                    from_addr=emails_meta[i].from_addr,
+                    to_addr=emails_meta[i].to_addr,
+                    date=emails_meta[i].date,
+                    snippet="",
+                )
+                for i in uncached_idx
+            ]
+            uncached_meta = [emails_meta[i] for i in uncached_idx]
+            new_results = classifier.classify_batch(uncached_inputs)
+            new_results = _enrich_with_body(client, classifier, uncached_meta, new_results)
+            for i, result in zip(uncached_idx, new_results):
+                results[i] = result
+                _set_cached(cache_keys[i], result)
+        else:
+            classifier = get_classifier()
+
+        final_results: list[ClassificationResult] = results  # type: ignore[assignment]
+        summary_inputs = [
             EmailInput(
-                subject=m.subject,
-                from_addr=m.from_addr,
-                to_addr=m.to_addr,
-                date=m.date,
-                snippet="",
+                subject=m.subject, from_addr=m.from_addr,
+                to_addr=m.to_addr, date=m.date, snippet="",
             )
             for m in emails_meta
         ]
-        results = classifier.classify_batch(inputs)
-        results = _enrich_with_body(client, classifier, emails_meta, results)
-        pairs = list(zip(inputs, results))
+        pairs = list(zip(summary_inputs, final_results))
         summary_text = classifier.generate_inbox_summary(pairs)
 
         label_counts: dict[str, int] = {}
-        for r in results:
+        for r in final_results:
             label_counts[r.label] = label_counts.get(r.label, 0) + 1
 
         return {

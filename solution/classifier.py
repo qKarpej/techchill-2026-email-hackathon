@@ -5,6 +5,7 @@ Classifies emails into 6 tiers and generates inbox summaries.
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
@@ -138,21 +139,26 @@ Respond with JSON in exactly this format:
     def classify_batch(
         self, emails: list[EmailInput]
     ) -> list[ClassificationResult]:
-        """Classify a list of emails, returning results in the same order."""
-        # Sequential for now — simple and avoids rate limits during hackathon
-        results = []
-        for e in emails:
+        """Classify a list of emails in parallel, returning results in the same order."""
+        if not emails:
+            return []
+
+        def _safe(e: EmailInput) -> ClassificationResult:
             try:
-                results.append(self.classify(e))
+                return self.classify(e)
             except Exception as ex:
-                results.append(ClassificationResult(
+                return ClassificationResult(
                     label="NORMAL",
                     confidence=0,
                     reasoning=f"Error: {ex}",
                     suggested_action="Read manually",
                     key_points=[],
-                ))
-        return results
+                )
+
+        # Cap workers to avoid hitting Anthropic rate limits
+        max_workers = min(len(emails), 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            return list(pool.map(_safe, emails))
 
     def analyze_for_response(
         self, subject: str, from_addr: str, body: str
