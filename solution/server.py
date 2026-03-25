@@ -12,6 +12,7 @@ Tools exposed:
   - fetch_email_content   — read a full email body by UID
   - mark_email_seen       — mark an email as read
   - mark_email_flagged    — flag an email for follow-up
+  - search_emails         — search inbox by keyword, sender, subject, date range
   - test_connection       — verify IMAP credentials are working
 """
 from __future__ import annotations
@@ -345,6 +346,63 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="search_emails",
+            description=(
+                "Search emails by any combination of keyword (searches headers + body), "
+                "sender, recipient, subject, and date range. Returns matching email metadata. "
+                "Use this when the user asks to find, look up, or search for specific emails."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword to search in headers and body (optional)",
+                    },
+                    "from_filter": {
+                        "type": "string",
+                        "description": "Filter by sender address or name (optional)",
+                    },
+                    "to_filter": {
+                        "type": "string",
+                        "description": "Filter by recipient address or name (optional)",
+                    },
+                    "subject_filter": {
+                        "type": "string",
+                        "description": "Filter by subject keyword (optional)",
+                    },
+                    "unread_only": {
+                        "type": "boolean",
+                        "description": "Only return unread emails (default: false)",
+                        "default": False,
+                    },
+                    "flagged_only": {
+                        "type": "boolean",
+                        "description": "Only return flagged/starred emails (default: false)",
+                        "default": False,
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "Return emails on or after this date (YYYY-MM-DD, optional)",
+                    },
+                    "before": {
+                        "type": "string",
+                        "description": "Return emails before this date (YYYY-MM-DD, optional)",
+                    },
+                    "mailbox": {
+                        "type": "string",
+                        "description": "Mailbox to search (default: INBOX)",
+                        "default": "INBOX",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default: 20, max: 50)",
+                        "default": 20,
+                    },
+                },
+            },
+        ),
+        Tool(
             name="test_connection",
             description="Test the IMAP connection to verify credentials and server are working.",
             inputSchema={"type": "object", "properties": {}},
@@ -424,7 +482,29 @@ async def _dispatch(name: str, args: dict) -> dict | list:
     client = EmailClient(config)
 
     # ------------------------------------------------------------------
-    if name == "test_connection":
+    if name == "search_emails":
+        from datetime import datetime as _dt
+        sf = SearchFilter(
+            unread_only=bool(args.get("unread_only", False)),
+            flagged_only=bool(args.get("flagged_only", False)),
+            from_addr=str(args.get("from_filter", "")),
+            to_addr=str(args.get("to_filter", "")),
+            subject=str(args.get("subject_filter", "")),
+            text=str(args.get("query", "")),
+            since=_dt.strptime(args["since"], "%Y-%m-%d") if args.get("since") else None,
+            before=_dt.strptime(args["before"], "%Y-%m-%d") if args.get("before") else None,
+            mailbox=str(args.get("mailbox", "INBOX")),
+            limit=min(int(args.get("limit", 20)), 50),
+        )
+        results = client.fetch_metadata(sf)
+        return {
+            "results": [asdict(m) for m in results],
+            "total": len(results),
+            "query": {k: v for k, v in args.items() if v},
+        }
+
+    # ------------------------------------------------------------------
+    elif name == "test_connection":
         success, message = client.test_connection()
         return {"success": success, "message": message}
 

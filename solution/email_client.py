@@ -49,7 +49,9 @@ class SearchFilter:
     unread_only: bool = False
     flagged_only: bool = False
     from_addr: str = ""
+    to_addr: str = ""
     subject: str = ""
+    text: str = ""  # IMAP TEXT — searches headers + body
     since: Optional[datetime] = None
     before: Optional[datetime] = None
     limit: int = 20
@@ -155,8 +157,12 @@ class EmailClient:
                 criteria.append("FLAGGED")
             if f.from_addr:
                 criteria.append(f'FROM "{f.from_addr}"')
+            if f.to_addr:
+                criteria.append(f'TO "{f.to_addr}"')
             if f.subject:
                 criteria.append(f'SUBJECT "{f.subject}"')
+            if f.text:
+                criteria.append(f'TEXT "{f.text}"')
             if f.since:
                 criteria.append(f'SINCE "{f.since.strftime("%d-%b-%Y")}"')
             if f.before:
