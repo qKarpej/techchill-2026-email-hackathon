@@ -49,10 +49,12 @@ class SearchFilter:
     unread_only: bool = False
     flagged_only: bool = False
     from_addr: str = ""
+    to_addr: str = ""
     subject: str = ""
+    text: str = ""  # IMAP TEXT — searches headers + body
     since: Optional[datetime] = None
     before: Optional[datetime] = None
-    limit: int = 20
+    limit: int = 30
     mailbox: str = "INBOX"
 
 
@@ -155,8 +157,12 @@ class EmailClient:
                 criteria.append("FLAGGED")
             if f.from_addr:
                 criteria.append(f'FROM "{f.from_addr}"')
+            if f.to_addr:
+                criteria.append(f'TO "{f.to_addr}"')
             if f.subject:
                 criteria.append(f'SUBJECT "{f.subject}"')
+            if f.text:
+                criteria.append(f'TEXT "{f.text}"')
             if f.since:
                 criteria.append(f'SINCE "{f.since.strftime("%d-%b-%Y")}"')
             if f.before:
@@ -228,7 +234,7 @@ class EmailClient:
         conn = self._connect()
         try:
             conn.select(mailbox, readonly=True)
-            _, data = conn.fetch(uid, "(UID FLAGS RFC822.SIZE RFC822)")
+            _, data = conn.uid("FETCH", uid, "(UID FLAGS RFC822.SIZE RFC822)")
 
             for item in data:
                 if not isinstance(item, tuple):
@@ -277,7 +283,7 @@ class EmailClient:
         conn = self._connect()
         try:
             conn.select(mailbox, readonly=False)
-            conn.store(uid, "+FLAGS", "\\Seen")
+            conn.uid("STORE", uid, "+FLAGS", "\\Seen")
         finally:
             conn.logout()
 
@@ -285,7 +291,7 @@ class EmailClient:
         conn = self._connect()
         try:
             conn.select(mailbox, readonly=False)
-            conn.store(uid, "+FLAGS", "\\Flagged")
+            conn.uid("STORE", uid, "+FLAGS", "\\Flagged")
         finally:
             conn.logout()
 

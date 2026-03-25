@@ -12,12 +12,15 @@ Tools exposed:
   - fetch_email_content   — read a full email body by UID
   - mark_email_seen       — mark an email as read
   - mark_email_flagged    — flag an email for follow-up
+  - search_emails         — search inbox by keyword, sender, subject, date range
   - test_connection       — verify IMAP credentials are working
 """
 from __future__ import annotations
 
 import json
 import os
+import pathlib
+import time
 from dataclasses import asdict
 
 from dotenv import load_dotenv
@@ -25,8 +28,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from classifier import ClassificationResult, EmailClassifier, EmailInput
-from email_client import EmailClient, EmailConfig, SearchFilter
+from classifier import ClassificationResult, DraftResult, EmailClassifier, EmailInput, ResponseOptions
+from email_client import EmailClient, EmailConfig, EmailMetadata, SearchFilter
 
 load_dotenv()
 
@@ -162,6 +165,121 @@ def format_classification(
 
 
 # ---------------------------------------------------------------------------
+# Classification cache
+# ---------------------------------------------------------------------------
+
+_CACHE_TTL = 3600.0  # seconds — re-classify after 1 hour
+_CACHE_FILE = pathlib.Path(__file__).parent / "classification_cache.json"
+_classification_cache: dict[str, tuple[ClassificationResult, float]] = {}
+
+
+def _cache_key(meta: EmailMetadata) -> str:
+    """Stable key: prefer message_id (globally unique), fall back to mailbox:uid."""
+    mid = (meta.message_id or "").strip()
+    return mid if mid else f"{meta.mailbox}:{meta.uid}"
+
+
+def _get_cached(key: str) -> ClassificationResult | None:
+    entry = _classification_cache.get(key)
+    if entry is None:
+        return None
+    result, ts = entry
+    if time.time() - ts > _CACHE_TTL:
+        del _classification_cache[key]
+        return None
+    return result
+
+
+def _set_cached(key: str, result: ClassificationResult) -> None:
+    _classification_cache[key] = (result, time.time())
+    _save_cache()
+
+
+def _save_cache() -> None:
+    data = {
+        key: {**asdict(result), "timestamp": ts}
+        for key, (result, ts) in _classification_cache.items()
+    }
+    _CACHE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_cache() -> None:
+    if not _CACHE_FILE.exists():
+        return
+    try:
+        data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    now = time.time()
+    for key, entry in data.items():
+        ts = float(entry.get("timestamp", 0))
+        if now - ts > _CACHE_TTL:
+            continue
+        try:
+            _classification_cache[key] = (
+                ClassificationResult(
+                    label=entry["label"],
+                    confidence=entry["confidence"],
+                    reasoning=entry["reasoning"],
+                    suggested_action=entry["suggested_action"],
+                    key_points=entry["key_points"],
+                ),
+                ts,
+            )
+        except (KeyError, TypeError):
+            continue
+
+
+_load_cache()
+
+
+# ---------------------------------------------------------------------------
+# Content-fallback helpers
+# ---------------------------------------------------------------------------
+
+_LOW_CONFIDENCE_THRESHOLD = 60
+
+
+def _enrich_with_body(
+    client: EmailClient,
+    classifier: EmailClassifier,
+    emails_meta: list[EmailMetadata],
+    results: list[ClassificationResult],
+) -> list[ClassificationResult]:
+    """Re-classify emails whose initial confidence is below the threshold.
+
+    Fetches the full body for each such email and runs a second classification
+    pass so that content — not just headers — informs the label.
+    """
+    enriched = list(results)
+    for i, (meta, result) in enumerate(zip(emails_meta, results)):
+        if result.confidence >= _LOW_CONFIDENCE_THRESHOLD:
+            continue
+        full = client.fetch_full_email(meta.uid, meta.mailbox)
+        if not full:
+            continue
+        email_input = EmailInput(
+            subject=full.subject,
+            from_addr=full.from_addr,
+            to_addr=full.to_addr,
+            date=full.date,
+            snippet=full.snippet or full.text_body[:400],
+        )
+        try:
+            enriched[i] = classifier.classify(email_input)
+        except Exception as ex:
+            # Keep the original result; don't fail the whole batch
+            enriched[i] = ClassificationResult(
+                label=result.label,
+                confidence=result.confidence,
+                reasoning=f"{result.reasoning} (body fetch failed: {ex})",
+                suggested_action=result.suggested_action,
+                key_points=result.key_points,
+            )
+    return enriched
+
+
+# ---------------------------------------------------------------------------
 # MCP server setup
 # ---------------------------------------------------------------------------
 
@@ -197,8 +315,8 @@ async def list_tools() -> list[Tool]:
                     "account_id": ACCOUNT_ID_PROP,
                     "limit": {
                         "type": "integer",
-                        "description": "Number of recent emails to classify (default: 20, max: 50)",
-                        "default": 20,
+                        "description": "Number of recent emails to classify (default: 30, max: 100)",
+                        "default": 30,
                     },
                     "unread_only": {
                         "type": "boolean",
@@ -330,6 +448,63 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="search_emails",
+            description=(
+                "Search emails by any combination of keyword (searches headers + body), "
+                "sender, recipient, subject, and date range. Returns matching email metadata. "
+                "Use this when the user asks to find, look up, or search for specific emails."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword to search in headers and body (optional)",
+                    },
+                    "from_filter": {
+                        "type": "string",
+                        "description": "Filter by sender address or name (optional)",
+                    },
+                    "to_filter": {
+                        "type": "string",
+                        "description": "Filter by recipient address or name (optional)",
+                    },
+                    "subject_filter": {
+                        "type": "string",
+                        "description": "Filter by subject keyword (optional)",
+                    },
+                    "unread_only": {
+                        "type": "boolean",
+                        "description": "Only return unread emails (default: false)",
+                        "default": False,
+                    },
+                    "flagged_only": {
+                        "type": "boolean",
+                        "description": "Only return flagged/starred emails (default: false)",
+                        "default": False,
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "Return emails on or after this date (YYYY-MM-DD, optional)",
+                    },
+                    "before": {
+                        "type": "string",
+                        "description": "Return emails before this date (YYYY-MM-DD, optional)",
+                    },
+                    "mailbox": {
+                        "type": "string",
+                        "description": "Mailbox to search (default: INBOX)",
+                        "default": "INBOX",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default: 30, max: 100)",
+                        "default": 30,
+                    },
+                },
+            },
+        ),
+        Tool(
             name="test_connection",
             description="Test the IMAP connection to verify credentials and server are working.",
             inputSchema={
@@ -337,6 +512,63 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "account_id": ACCOUNT_ID_PROP,
                 },
+            },
+        ),
+        Tool(
+            name="analyze_email_for_response",
+            description=(
+                "Read a full email and return contextually appropriate response options, "
+                "the email's detected tone, a summary of what it's asking, and whether "
+                "clarification from the user is needed before drafting a reply. "
+                "Call this first before draft_email_response."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "UID of the email to analyze",
+                    },
+                    "mailbox": {
+                        "type": "string",
+                        "description": "Mailbox containing the email (default: INBOX)",
+                        "default": "INBOX",
+                    },
+                },
+                "required": ["uid"],
+            },
+        ),
+        Tool(
+            name="draft_email_response",
+            description=(
+                "Draft a reply to an email given the user's chosen core answer and optional "
+                "clarification. Fetches the full email for context; tone of the reply is "
+                "matched to the original. Use analyze_email_for_response first to get "
+                "the list of response options to present to the user."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "UID of the email to reply to",
+                    },
+                    "mailbox": {
+                        "type": "string",
+                        "description": "Mailbox containing the email (default: INBOX)",
+                        "default": "INBOX",
+                    },
+                    "core_answer": {
+                        "type": "string",
+                        "description": "The user's core answer, e.g. 'Yes, I can attend'",
+                    },
+                    "clarification": {
+                        "type": "string",
+                        "description": "Optional extra context or reason from the user",
+                        "default": "",
+                    },
+                },
+                "required": ["uid", "core_answer"],
             },
         ),
     ]
@@ -373,7 +605,29 @@ async def _dispatch(name: str, args: dict) -> dict | list:
     client = _get_client(account_id)
 
     # ------------------------------------------------------------------
-    if name == "test_connection":
+    if name == "search_emails":
+        from datetime import datetime as _dt
+        sf = SearchFilter(
+            unread_only=bool(args.get("unread_only", False)),
+            flagged_only=bool(args.get("flagged_only", False)),
+            from_addr=str(args.get("from_filter", "")),
+            to_addr=str(args.get("to_filter", "")),
+            subject=str(args.get("subject_filter", "")),
+            text=str(args.get("query", "")),
+            since=_dt.strptime(args["since"], "%Y-%m-%d") if args.get("since") else None,
+            before=_dt.strptime(args["before"], "%Y-%m-%d") if args.get("before") else None,
+            mailbox=str(args.get("mailbox", "INBOX")),
+            limit=min(int(args.get("limit", 30)), 100),
+        )
+        results = client.fetch_metadata(sf)
+        return {
+            "results": [asdict(m) for m in results],
+            "total": len(results),
+            "query": {k: v for k, v in args.items() if v},
+        }
+
+    # ------------------------------------------------------------------
+    elif name == "test_connection":
         success, message = client.test_connection()
         return {"success": success, "message": message, "account_id": account_id}
 
@@ -412,6 +666,11 @@ async def _dispatch(name: str, args: dict) -> dict | list:
         if not full:
             return {"error": f"Email UID {uid} not found"}
 
+        key = (full.message_id or "").strip() or f"{mailbox}:{uid}"
+        cached = _get_cached(key)
+        if cached:
+            return {**format_classification(asdict(full), cached), "from_cache": True}
+
         classifier = get_classifier()
         email_input = EmailInput(
             subject=full.subject,
@@ -421,11 +680,12 @@ async def _dispatch(name: str, args: dict) -> dict | list:
             snippet=full.snippet or full.text_body[:400],
         )
         result = classifier.classify(email_input)
+        _set_cached(key, result)
         return format_classification(asdict(full), result)
 
     # ------------------------------------------------------------------
     elif name == "classify_inbox":
-        limit = min(int(args.get("limit", 20)), 50)
+        limit = min(int(args.get("limit", 30)), 100)
         search_filter = SearchFilter(
             unread_only=bool(args.get("unread_only", False)),
             from_addr=str(args.get("from_filter", "")),
@@ -442,22 +702,35 @@ async def _dispatch(name: str, args: dict) -> dict | list:
                 "total": 0,
             }
 
-        classifier = get_classifier()
-        inputs = [
-            EmailInput(
-                subject=m.subject,
-                from_addr=m.from_addr,
-                to_addr=m.to_addr,
-                date=m.date,
-                snippet="",  # Metadata only for batch — fast
-            )
-            for m in emails_meta
-        ]
-        results = classifier.classify_batch(inputs)
+        # Serve cached results; only classify emails we haven't seen recently
+        cache_keys = [_cache_key(m) for m in emails_meta]
+        results: list[ClassificationResult | None] = [_get_cached(k) for k in cache_keys]
+
+        uncached_idx = [i for i, r in enumerate(results) if r is None]
+        if uncached_idx:
+            classifier = get_classifier()
+            uncached_inputs = [
+                EmailInput(
+                    subject=emails_meta[i].subject,
+                    from_addr=emails_meta[i].from_addr,
+                    to_addr=emails_meta[i].to_addr,
+                    date=emails_meta[i].date,
+                    snippet="",
+                )
+                for i in uncached_idx
+            ]
+            uncached_meta = [emails_meta[i] for i in uncached_idx]
+            new_results = classifier.classify_batch(uncached_inputs)
+            new_results = _enrich_with_body(client, classifier, uncached_meta, new_results)
+            for i, result in zip(uncached_idx, new_results):
+                results[i] = result
+                _set_cached(cache_keys[i], result)
+
+        final_results: list[ClassificationResult] = results  # type: ignore[assignment]
 
         # Sort by priority: URGENT → IMPORTANT → NORMAL → LOW → NEWSLETTER → SPAM
         priority = {"URGENT": 0, "IMPORTANT": 1, "NORMAL": 2, "LOW": 3, "NEWSLETTER": 4, "SPAM": 5}
-        classified_pairs = list(zip(emails_meta, results))
+        classified_pairs = list(zip(emails_meta, final_results))
         classified_pairs.sort(key=lambda p: priority.get(p[1].label, 99))
 
         classified_output = [
@@ -478,7 +751,7 @@ async def _dispatch(name: str, args: dict) -> dict | list:
 
     # ------------------------------------------------------------------
     elif name == "get_inbox_summary":
-        limit = min(int(args.get("limit", 30)), 50)
+        limit = min(int(args.get("limit", 30)), 100)
         search_filter = SearchFilter(
             unread_only=bool(args.get("unread_only", False)),
             mailbox="INBOX",
@@ -489,29 +762,101 @@ async def _dispatch(name: str, args: dict) -> dict | list:
         if not emails_meta:
             return {"summary": "Your inbox appears to be empty or no emails match the criteria."}
 
-        classifier = get_classifier()
-        inputs = [
+        cache_keys = [_cache_key(m) for m in emails_meta]
+        results: list[ClassificationResult | None] = [_get_cached(k) for k in cache_keys]
+
+        uncached_idx = [i for i, r in enumerate(results) if r is None]
+        if uncached_idx:
+            classifier = get_classifier()
+            uncached_inputs = [
+                EmailInput(
+                    subject=emails_meta[i].subject,
+                    from_addr=emails_meta[i].from_addr,
+                    to_addr=emails_meta[i].to_addr,
+                    date=emails_meta[i].date,
+                    snippet="",
+                )
+                for i in uncached_idx
+            ]
+            uncached_meta = [emails_meta[i] for i in uncached_idx]
+            new_results = classifier.classify_batch(uncached_inputs)
+            new_results = _enrich_with_body(client, classifier, uncached_meta, new_results)
+            for i, result in zip(uncached_idx, new_results):
+                results[i] = result
+                _set_cached(cache_keys[i], result)
+        else:
+            classifier = get_classifier()
+
+        final_results: list[ClassificationResult] = results  # type: ignore[assignment]
+        summary_inputs = [
             EmailInput(
-                subject=m.subject,
-                from_addr=m.from_addr,
-                to_addr=m.to_addr,
-                date=m.date,
-                snippet="",
+                subject=m.subject, from_addr=m.from_addr,
+                to_addr=m.to_addr, date=m.date, snippet="",
             )
             for m in emails_meta
         ]
-        results = classifier.classify_batch(inputs)
-        pairs = list(zip(inputs, results))
+        pairs = list(zip(summary_inputs, final_results))
         summary_text = classifier.generate_inbox_summary(pairs)
 
         label_counts: dict[str, int] = {}
-        for _, r in results:
+        for r in final_results:
             label_counts[r.label] = label_counts.get(r.label, 0) + 1
 
         return {
             "summary": summary_text,
             "breakdown": label_counts,
             "total_analyzed": len(emails_meta),
+        }
+
+    # ------------------------------------------------------------------
+    elif name == "analyze_email_for_response":
+        uid = str(args["uid"])
+        mailbox = args.get("mailbox", "INBOX")
+        full = client.fetch_full_email(uid, mailbox)
+        if not full:
+            return {"error": f"Email UID {uid} not found in {mailbox}"}
+
+        classifier = get_classifier()
+        options: ResponseOptions = classifier.analyze_for_response(
+            subject=full.subject,
+            from_addr=full.from_addr,
+            body=full.text_body or full.snippet,
+        )
+        return {
+            "uid": uid,
+            "email_summary": options.email_summary,
+            "detected_tone": options.detected_tone,
+            "suggested_responses": options.suggested_responses,
+            "needs_clarification": options.needs_clarification,
+            "clarification_prompt": options.clarification_prompt,
+        }
+
+    # ------------------------------------------------------------------
+    elif name == "draft_email_response":
+        uid = str(args["uid"])
+        mailbox = args.get("mailbox", "INBOX")
+        core_answer = str(args["core_answer"])
+        clarification = str(args.get("clarification", ""))
+
+        full = client.fetch_full_email(uid, mailbox)
+        if not full:
+            return {"error": f"Email UID {uid} not found in {mailbox}"}
+
+        classifier = get_classifier()
+        draft: DraftResult = classifier.draft_response(
+            subject=full.subject,
+            from_addr=full.from_addr,
+            to_addr=full.to_addr,
+            body=full.text_body or full.snippet,
+            core_answer=core_answer,
+            clarification=clarification,
+        )
+        return {
+            "uid": uid,
+            "reply_to": full.from_addr,
+            "subject": draft.subject,
+            "body": draft.body,
+            "tone_used": draft.tone_used,
         }
 
     else:

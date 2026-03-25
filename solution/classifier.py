@@ -5,6 +5,7 @@ Classifies emails into 6 tiers and generates inbox summaries.
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
@@ -41,6 +42,22 @@ Classification rules:
 - Never classify a clearly personal email from a real person as SPAM
 
 Respond with valid JSON only — no markdown, no explanation outside the JSON."""
+
+
+@dataclass
+class ResponseOptions:
+    suggested_responses: list[str]  # 4–6 contextual response options
+    needs_clarification: bool        # Whether a reason/extra detail would help
+    clarification_prompt: str        # Question to ask the user if clarification is needed
+    detected_tone: str               # "formal" | "professional" | "casual" | "friendly"
+    email_summary: str               # One-sentence summary of what the email wants
+
+
+@dataclass
+class DraftResult:
+    subject: str    # "Re: <original subject>"
+    body: str       # Full email body text
+    tone_used: str  # Tone applied to the draft
 
 
 @dataclass
@@ -122,21 +139,143 @@ Respond with JSON in exactly this format:
     def classify_batch(
         self, emails: list[EmailInput]
     ) -> list[ClassificationResult]:
-        """Classify a list of emails, returning results in the same order."""
-        # Sequential for now — simple and avoids rate limits during hackathon
-        results = []
-        for e in emails:
+        """Classify a list of emails in parallel, returning results in the same order."""
+        if not emails:
+            return []
+
+        def _safe(e: EmailInput) -> ClassificationResult:
             try:
-                results.append(self.classify(e))
+                return self.classify(e)
             except Exception as ex:
-                results.append(ClassificationResult(
+                return ClassificationResult(
                     label="NORMAL",
                     confidence=0,
                     reasoning=f"Error: {ex}",
                     suggested_action="Read manually",
                     key_points=[],
-                ))
-        return results
+                )
+
+        # Cap workers to avoid hitting Anthropic rate limits
+        max_workers = min(len(emails), 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            return list(pool.map(_safe, emails))
+
+    def analyze_for_response(
+        self, subject: str, from_addr: str, body: str
+    ) -> ResponseOptions:
+        """Read a full email and return contextual response options plus tone/summary."""
+        prompt = f"""You are helping a user decide how to reply to an email.
+Read the email below and:
+1. Write 4-6 short, contextually appropriate response options (e.g. "Yes, I can attend",
+   "I need more time", "I've already sent it"). Tailor these to what the email is actually asking.
+2. Decide if providing a reason or extra detail would meaningfully improve the reply
+   (needs_clarification = true/false).
+3. If needs_clarification is true, write a short, specific question to ask the user
+   (e.g. "What is the reason you cannot attend?").
+4. Detect the tone/formality of the original email: one of "formal", "professional",
+   "casual", or "friendly".
+5. Write a one-sentence summary of what the email is requesting or asking.
+
+Email:
+Subject: {subject}
+From: {from_addr}
+Body:
+{body or "(no body)"}
+
+Respond with valid JSON only - no markdown:
+{{
+  "suggested_responses": ["<option1>", "<option2>", ...],
+  "needs_clarification": <true|false>,
+  "clarification_prompt": "<question or empty string>",
+  "detected_tone": "<formal|professional|casual|friendly>",
+  "email_summary": "<one sentence>"
+}}"""
+
+        response = self.client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(
+            block.text for block in response.content if block.type == "text"
+        ).strip()
+
+        try:
+            data = json.loads(text)
+            return ResponseOptions(
+                suggested_responses=list(data.get("suggested_responses", [])),
+                needs_clarification=bool(data.get("needs_clarification", False)),
+                clarification_prompt=str(data.get("clarification_prompt", "")),
+                detected_tone=str(data.get("detected_tone", "professional")),
+                email_summary=str(data.get("email_summary", "")),
+            )
+        except (json.JSONDecodeError, KeyError, ValueError):
+            return ResponseOptions(
+                suggested_responses=["Yes", "No", "I need more time", "Let me get back to you"],
+                needs_clarification=False,
+                clarification_prompt="",
+                detected_tone="professional",
+                email_summary="Could not parse email summary",
+            )
+
+    def draft_response(
+        self,
+        subject: str,
+        from_addr: str,
+        to_addr: str,
+        body: str,
+        core_answer: str,
+        clarification: str = "",
+    ) -> DraftResult:
+        """Draft a reply email given the original email and the user's chosen answer."""
+        prompt = f"""You are drafting an email reply on behalf of the user.
+
+Original email:
+Subject: {subject}
+From: {from_addr}
+To: {to_addr}
+Body:
+{body or "(no body)"}
+
+User's core answer: {core_answer}
+Additional context from user: {clarification or "(none provided)"}
+
+Instructions:
+- Match the tone and formality of the original email exactly.
+- Be concise - do not pad with unnecessary pleasantries or filler sentences.
+- Do NOT invent facts, commitments, or details the user did not provide.
+- Start the body directly (no "Subject:" line in the body field).
+- The subject should be "Re: {subject}" unless a different subject is clearly appropriate.
+
+Respond with valid JSON only - no markdown:
+{{
+  "subject": "<reply subject>",
+  "body": "<full reply body text>",
+  "tone_used": "<formal|professional|casual|friendly>"
+}}"""
+
+        response = self.client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(
+            block.text for block in response.content if block.type == "text"
+        ).strip()
+
+        try:
+            data = json.loads(text)
+            return DraftResult(
+                subject=str(data.get("subject", f"Re: {subject}")),
+                body=str(data.get("body", "")),
+                tone_used=str(data.get("tone_used", "professional")),
+            )
+        except (json.JSONDecodeError, KeyError, ValueError):
+            return DraftResult(
+                subject=f"Re: {subject}",
+                body="Could not generate draft - please try again.",
+                tone_used="unknown",
+            )
 
     def generate_inbox_summary(
         self,

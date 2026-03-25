@@ -2,3 +2,4 @@
 node_modules/
 .env
 *.log
+solution/classification_cache.json
