@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import time
 from dataclasses import asdict
 
@@ -88,6 +89,7 @@ def format_classification(
 # ---------------------------------------------------------------------------
 
 _CACHE_TTL = 3600.0  # seconds — re-classify after 1 hour
+_CACHE_FILE = pathlib.Path(__file__).parent / "classification_cache.json"
 _classification_cache: dict[str, tuple[ClassificationResult, float]] = {}
 
 
@@ -102,14 +104,53 @@ def _get_cached(key: str) -> ClassificationResult | None:
     if entry is None:
         return None
     result, ts = entry
-    if time.monotonic() - ts > _CACHE_TTL:
+    if time.time() - ts > _CACHE_TTL:
         del _classification_cache[key]
         return None
     return result
 
 
 def _set_cached(key: str, result: ClassificationResult) -> None:
-    _classification_cache[key] = (result, time.monotonic())
+    _classification_cache[key] = (result, time.time())
+    _save_cache()
+
+
+def _save_cache() -> None:
+    data = {
+        key: {**asdict(result), "timestamp": ts}
+        for key, (result, ts) in _classification_cache.items()
+    }
+    _CACHE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_cache() -> None:
+    if not _CACHE_FILE.exists():
+        return
+    try:
+        data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    now = time.time()
+    for key, entry in data.items():
+        ts = float(entry.get("timestamp", 0))
+        if now - ts > _CACHE_TTL:
+            continue
+        try:
+            _classification_cache[key] = (
+                ClassificationResult(
+                    label=entry["label"],
+                    confidence=entry["confidence"],
+                    reasoning=entry["reasoning"],
+                    suggested_action=entry["suggested_action"],
+                    key_points=entry["key_points"],
+                ),
+                ts,
+            )
+        except (KeyError, TypeError):
+            continue
+
+
+_load_cache()
 
 
 # ---------------------------------------------------------------------------
