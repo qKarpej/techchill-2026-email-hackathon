@@ -223,8 +223,8 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "limit": {
                         "type": "integer",
-                        "description": "Number of recent emails to classify (default: 20, max: 50)",
-                        "default": 20,
+                        "description": "Number of recent emails to classify (default: 30, max: 100)",
+                        "default": 30,
                     },
                     "unread_only": {
                         "type": "boolean",
@@ -396,8 +396,8 @@ async def list_tools() -> list[Tool]:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max results to return (default: 20, max: 50)",
-                        "default": 20,
+                        "description": "Max results to return (default: 30, max: 100)",
+                        "default": 30,
                     },
                 },
             },
@@ -494,7 +494,7 @@ async def _dispatch(name: str, args: dict) -> dict | list:
             since=_dt.strptime(args["since"], "%Y-%m-%d") if args.get("since") else None,
             before=_dt.strptime(args["before"], "%Y-%m-%d") if args.get("before") else None,
             mailbox=str(args.get("mailbox", "INBOX")),
-            limit=min(int(args.get("limit", 20)), 50),
+            limit=min(int(args.get("limit", 30)), 100),
         )
         results = client.fetch_metadata(sf)
         return {
@@ -562,7 +562,7 @@ async def _dispatch(name: str, args: dict) -> dict | list:
 
     # ------------------------------------------------------------------
     elif name == "classify_inbox":
-        limit = min(int(args.get("limit", 20)), 50)
+        limit = min(int(args.get("limit", 30)), 100)
         search_filter = SearchFilter(
             unread_only=bool(args.get("unread_only", False)),
             from_addr=str(args.get("from_filter", "")),
@@ -628,7 +628,7 @@ async def _dispatch(name: str, args: dict) -> dict | list:
 
     # ------------------------------------------------------------------
     elif name == "get_inbox_summary":
-        limit = min(int(args.get("limit", 30)), 50)
+        limit = min(int(args.get("limit", 30)), 100)
         search_filter = SearchFilter(
             unread_only=bool(args.get("unread_only", False)),
             mailbox="INBOX",

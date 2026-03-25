@@ -54,7 +54,7 @@ class SearchFilter:
     text: str = ""  # IMAP TEXT — searches headers + body
     since: Optional[datetime] = None
     before: Optional[datetime] = None
-    limit: int = 20
+    limit: int = 30
     mailbox: str = "INBOX"
 
 
